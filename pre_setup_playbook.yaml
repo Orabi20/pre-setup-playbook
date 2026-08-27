@@ -1,0 +1,404 @@
+---
+- name: Pre-setup
+  hosts: all
+  become: true
+
+  tasks:
+    # -------------------------------
+    # System Update Section
+    # -------------------------------
+    - name: Update system packages (Debian/Ubuntu)
+      ansible.builtin.apt:
+        update_cache: yes
+        upgrade: dist
+      when: ansible_os_family == "Debian"
+      ignore_errors: yes
+
+    - name: Update system packages (RedHat)
+      ansible.builtin.yum:
+        name: "*"
+        state: latest
+      when: ansible_os_family == "RedHat"
+      ignore_errors: yes
+
+    # -------------------------------
+    # Gather hardware facts
+    # -------------------------------
+    - name: Gather hardware facts
+      ansible.builtin.setup:
+        gather_subset:
+          - hardware
+
+    - name: Show only disks with no partitions
+      ansible.builtin.debug:
+        msg: "{{ item.key }}"
+      loop: "{{ ansible_facts.devices | dict2items }}"
+      when: item.value.partitions is defined and item.value.partitions | length == 0
+
+    # -------------------------------
+    # Disk partition and mount setup
+    # -------------------------------
+
+    # -------------------------------
+    # RedHat section
+    # -------------------------------
+    - name: Find empty disks (RedHat)
+      set_fact:
+        empty_disks: >-
+          {{
+            (
+              ansible_facts.devices
+              | dict2items
+              | selectattr('key', 'match', '^sd')
+              | selectattr('value.partitions', 'defined')
+              | selectattr('value.partitions', 'equalto', {})
+              | map(attribute='key')
+              | list
+            )
+            +
+            (
+              ansible_facts.devices
+              | dict2items
+              | selectattr('key', 'match', '^sd')
+              | rejectattr('value.partitions', 'defined')
+              | map(attribute='key')
+              | list
+            )
+          }}
+      when: ansible_os_family == "RedHat"
+
+    - name: Debug found disks (RedHat)
+      debug:
+        msg: "Empty disks detected: {{ empty_disks | join(', ') if empty_disks else 'None found' }}"
+      when: ansible_os_family == "RedHat"
+
+    - name: Pick first empty disk (RedHat)
+      ansible.builtin.set_fact:
+        disk_device: "/dev/{{ empty_disks[0] }}"
+      when:
+        - ansible_os_family == "RedHat"
+        - empty_disks | length > 0
+
+    - name: Fail if no unpartitioned disks found (RedHat)
+      ansible.builtin.fail:
+        msg: "No unpartitioned disks found. Exiting safely."
+      when:
+        - ansible_os_family == "RedHat"
+        - empty_disks | length == 0
+      ignore_errors: yes
+    # -------------------------------
+    # Detect empty non-system disk (Debian only)
+    # -------------------------------
+    - name: Detect empty non-system disk (Debian)
+      set_fact:
+       disk_device: "/dev/{{ item.key }}"
+      loop: "{{ ansible_facts.devices | dict2items }}"
+      when:
+          - ansible_os_family == "Debian"
+          - item.key is not match('^(dm-|loop|sr|ram)')
+          - item.value.partitions | length == 0
+          - item.key != (
+             ansible_facts.mounts
+             | selectattr('mount','equalto','/')
+             | map(attribute='device')
+             | first
+             | regex_replace('[0-9]+$', '')
+             | basename
+            )
+
+
+    # -------------------------------
+    # Partitioning and Mounting
+    # -------------------------------
+    - name: Create a new ext4 primary partition
+      community.general.parted:
+        device: "{{ disk_device }}"
+        number: 1
+        state: present
+        fs_type: ext4
+      ignore_errors: yes
+
+    - name: Format partition as ext4
+      ansible.builtin.filesystem:
+        fstype: ext4
+        dev: "{{ disk_device }}1"
+        force: yes
+      ignore_errors: yes
+
+    - name: Create /data directory if it does not exist
+      ansible.builtin.file:
+        path: "{{ path }}"
+        state: directory
+        mode: '0755'
+
+    - name: Get UUID of new partition
+      ansible.builtin.command: blkid -s UUID -o value {{ disk_device }}1
+      register: blkid_output
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Show the UUID
+      debug:
+        msg: "The UUID of the device is {{ blkid_output.stdout }}"
+      ignore_errors: yes
+
+    - name: Mount device by UUID
+      ansible.posix.mount:
+        path: "{{ path }}"
+        src: "UUID={{ blkid_output.stdout }}"
+        fstype: ext4
+        opts: noatime
+        state: mounted
+      ignore_errors: yes
+
+    # -------------------------------
+    # DNS configuration
+    # -------------------------------
+    - name: Configure resolv.conf on RHEL
+      ansible.builtin.shell: |
+        chattr -i /etc/resolv.conf || true
+        echo "nameserver {{ dns_server_ip }}" > /etc/resolv.conf
+        chattr +i /etc/resolv.conf
+      when: ansible_os_family == "RedHat"
+      tags:
+       - dns
+
+    - name: Configure resolv.conf on Debian/Ubuntu
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        content: "nameserver {{ dns_server_ip }}\n"
+        owner: root
+        group: root
+        mode: '0644'
+      when: ansible_os_family == "Debian"
+
+    - name: Make resolv.conf immutable
+      ansible.builtin.command: chattr +i /etc/resolv.conf
+      when: ansible_os_family == "Debian"
+      tags:
+        - dns
+
+    # -------------------------------
+    # Time synchronization setup
+    # -------------------------------
+    - name: Install chrony on RedHat-based systems
+      ansible.builtin.package:
+        name: chrony
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Remove systemd-timesyncd if present
+      ansible.builtin.apt:
+        name: systemd-timesyncd
+        state: absent
+      when: ansible_os_family == "Debian"
+
+    - name: Install ntp on Debian-based systems
+      ansible.builtin.package:
+        name: ntp
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Configure Chrony (RHEL)
+      ansible.builtin.template:
+        src: /mnt/c/Users/ahmed.orabi/ansible/templates/chrony.conf.j2
+        dest: /etc/chrony.conf
+        owner: root
+        group: root
+        mode: '0644'
+      when: ansible_os_family == "RedHat"
+      notify: Restart chronyd
+
+    - name: Configure NTP (Ubuntu/Debian)
+      ansible.builtin.template:
+        src: /root/playbooks/templates/ntp.conf.j2
+        dest: /etc/ntp.conf
+        owner: root
+        group: root
+        mode: '0644'
+      when: ansible_os_family == "Debian"
+      notify: Restart ntp
+
+    - name: Set timezone to Africa/Cairo
+      ansible.builtin.timezone:
+       name: Africa/Cairo
+
+    # -------------------------------
+    # OpenSCAP installation
+    # -------------------------------
+    - name: Install and run OpenSCAP (RedHat)
+      ansible.builtin.shell: |
+        dnf install -y openscap-scanner scap-security-guide
+        cd /usr/share/xml/scap/ssg/content
+        oscap xccdf eval --profile xccdf_org.ssgproject.content_profile_cis_server_l1 \
+          --results scan_results.xml --report scan_report.html ssg-rhel9-ds.xml
+        oscap xccdf eval --remediate --profile xccdf_org.ssgproject.content_profile_cis_server_l1 \
+          --results scan_results.xml ssg-rhel9-ds.xml
+      register: openscap_result
+      failed_when: >
+        openscap_result.rc not in [0, 1, 2, 3]
+      when: ansible_os_family == "RedHat"
+      ignore_errors: yes
+      tags: openscap
+
+    - name: Install and run OpenSCAP (Ubuntu)
+      ansible.builtin.shell: |
+        apt-get update -y
+        apt-get install -y openscap-scanner ssg-base ssg-debderived
+        cd /usr/share/xml/scap/ssg/content
+        oscap xccdf eval --profile xccdf_org.ssgproject.content_profile_cis_level1_server \
+          --results scan_results.xml --report scan_report.html ssg-ubuntu2204-ds.xml
+        oscap xccdf eval --remediate --profile xccdf_org.ssgproject.content_profile_cis_level1_server \
+          --results scan_results.xml ssg-ubuntu2204-ds.xml
+      args:
+        warn: false
+      register: openscap_result
+      failed_when: >
+        openscap_result.rc not in [0, 1, 2, 3]
+      when:
+        - ansible_os_family == "Debian"
+        - ansible_facts['distribution'] == "Ubuntu"
+        - ansible_facts['distribution_version'] is not version('24.04', '==')
+      ignore_errors: yes
+
+    # =====================================
+    # OpenSCAP installation (Ubuntu 24.04 only)
+    # =====================================
+    - name: Install OpenSCAP (Ubuntu)
+      apt:
+       name:
+        - openscap-scanner
+        - openscap-common
+        - libopenscap25t64
+       state: present
+       update_cache: yes
+      when:
+        - ansible_facts['os_family'] == "Debian"
+        - ansible_facts['distribution'] == "Ubuntu"
+        - ansible_facts['distribution_version'] is version('24.04', '==')
+
+    - name: Run OpenSCAP scan and remediation for Ubuntu 24.04 only
+      block:
+        - name: Ensure unzip is installed
+          apt:
+            name: unzip
+            state: present
+            update_cache: yes
+
+        - name: Download SCAP Security Guide v0.1.77 (using wget)
+          ansible.builtin.shell: |
+            wget -O /tmp/scap-security-guide-0.1.77.zip \
+            https://github.com/ComplianceAsCode/content/releases/download/v0.1.77/scap-security-guide-0.1.77.zip
+          args:
+              warn: false
+
+        - name: Unzip SCAP Security Guide
+          unarchive:
+            src: /tmp/scap-security-guide-0.1.77.zip
+            dest: /tmp/
+            remote_src: true
+
+        - name: Run SCAP evaluation
+          ansible.builtin.shell: |
+            cd /tmp/scap-security-guide-0.1.77 && \
+            oscap xccdf eval \
+              --profile xccdf_org.ssgproject.content_profile_cis_level1_server \
+              --results scan_report.xml \
+              --report scan_report.html \
+              ./ssg-ubuntu2404-ds.xml
+          register: openscap_result
+          failed_when: >
+            openscap_result.rc not in [0, 1, 2, 3]
+
+        - name: Run SCAP remediation
+          ansible.builtin.shell: |
+            cd /tmp/scap-security-guide-0.1.77 && \
+            oscap xccdf eval \
+              --remediate \
+              --profile xccdf_org.ssgproject.content_profile_cis_level1_server \
+              --results scan_results.xml \
+              --report scan_results.html \
+              ./ssg-ubuntu2404-ds.xml
+          register: openscap_result
+          failed_when: >
+            openscap_result.rc not in [0, 1, 2, 3]
+
+        - name: Cleanup temporary SCAP files
+          file:
+            path: /tmp/scap-security-guide-0.1.77
+            state: absent
+      when:
+        - ansible_facts['os_family'] == "Debian"
+        - ansible_facts['distribution'] == "Ubuntu"
+        - ansible_facts['distribution_version'] is version('24.04', '==')
+      ignore_errors: yes
+
+    # -------------------------------
+    # Firewall disable
+    # -------------------------------
+    - name: Stop and disable firewalld on RedHat systems
+      ansible.builtin.service:
+        name: firewalld
+        state: stopped
+        enabled: no
+      when: ansible_os_family == "RedHat"
+
+    - name: Stop and disable ufw on Debian/Ubuntu systems
+      ansible.builtin.service:
+        name: ufw
+        state: stopped
+        enabled: no
+      when: ansible_os_family == "Debian"
+
+    # -------------------------------
+    # SELinux and AppArmor disable
+    # -------------------------------
+    - name: Disable SELinux permanently
+      ansible.builtin.replace:
+        path: /etc/selinux/config
+        regexp: '^SELINUX=.*'
+        replace: 'SELINUX=disabled'
+      when: ansible_os_family == "RedHat"
+
+    - name: Disable AppArmor permanently
+      ansible.builtin.replace:
+        path: /etc/default/grub
+        regexp: '^(GRUB_CMDLINE_LINUX=.*)"$'
+        replace: '\1 apparmor=0"'
+      when: ansible_os_family == "Debian"
+
+    - name: Update grub after disabling AppArmor
+      ansible.builtin.command: update-grub
+      when: ansible_os_family == "Debian"
+
+    # -------------------------------
+    # Creating Our Users
+    # -------------------------------
+    - name: create users for [ELA,Backup,Vascan]
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        state: present
+        password: "{{ item.password }}"
+        shell: /bin/bash
+        home: "/home/{{ item.name }}"
+        create_home: yes
+      loop: "{{ users_list }}"
+
+    - name: Add users to sudo or wheel group
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        groups: "{{ 'sudo' if ansible_os_family == 'Debian' else 'wheel' }}"
+        append: yes
+      loop: "{{ users_list }}"
+
+  handlers:
+    - name: Restart chronyd
+      ansible.builtin.service:
+        name: chronyd
+        state: restarted
+
+    - name: Restart ntp
+      ansible.builtin.service:
+        name: "{{ 'ntp' if ansible_os_family == 'Debian' else 'chronyd' }}"
+        state: restarted
+
