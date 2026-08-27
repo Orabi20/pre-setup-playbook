@@ -1,0 +1,66 @@
+# Managed by Ansible - DO NOT EDIT MANUALLY
+
+Port 22
+Protocol 2
+
+# Strong MACs, KEX, Ciphers
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+KexAlgorithms curve25519-sha256@libssh.org
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+
+# Idle timeout
+ClientAliveInterval 120
+ClientAliveCountMax 3
+
+# HostKeys
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+# Logging
+SyslogFacility AUTH
+LogLevel INFO
+
+# Authentication
+LoginGraceTime 60
+PermitRootLogin no
+PermitUserEnvironment no
+PermitEmptyPasswords no
+StrictModes yes
+PubkeyAuthentication yes
+PasswordAuthentication yes
+
+# Brute force protection (PAM faillock also configured)
+MaxAuthTries 4
+
+# X11 + tunneling
+X11Forwarding no
+
+# Banner
+Banner /etc/issue.net
+
+# Rhosts and host-based auth not allowed
+IgnoreRhosts yes
+HostbasedAuthentication no
+
+# Challenge-response / keyboard-interactive
+ChallengeResponseAuthentication no
+
+# Keep PAM enabled
+UsePAM yes
+
+# Other hardening
+UseDNS no
+GSSAPIAuthentication no
+
+# Accept locale env
+AcceptEnv LANG LC_*
+
+# SFTP
+Subsystem sftp /usr/lib/openssh/sftp-server
+
+# Optionally adjust per-host ListenAddress or AllowUsers below (commented)
+#ListenAddress 0.0.0.0
+#AllowUsers adminuser opsuser
+
+
